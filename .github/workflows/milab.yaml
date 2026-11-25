@@ -1,0 +1,126 @@
+# MiLaboratories build of the AppWrapper controller (see MILAB.md).
+#
+# - Pull requests into `milab` and pushes to `milab`: unit tests and an image build without push.
+# - Tag vX.Y.Z-milab.N on `milab`: unit tests, multi-arch image pushed to
+#   quay.io/milaboratories/pl-containers:appwrapper-vX.Y.Z-milab.N (served also as
+#   containers.pl-open.science/milaboratories/pl-containers), and a GitHub release with install.yaml
+#   that points at that image.
+#
+# The upstream workflows (CI*.yaml, release.yaml) run only for `main` or only in
+# project-codeflare/appwrapper, so they do not fire for our branch or our tags.
+name: milab
+
+on:
+  pull_request:
+    branches: [milab]
+  push:
+    branches: [milab]
+    tags: ['v*-milab.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: milab-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_REPO: quay.io/milaboratories/pl-containers
+  # Our clusters run amd64 and arm64 nodes only.
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ./go.mod
+
+      - name: Unit tests (envtest)
+        run: make test
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # GitHub release for a tag
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version and image
+        id: v
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-milab\.[0-9]+$ ]]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match vX.Y.Z-milab.N"
+              exit 1
+            fi
+            version="${GITHUB_REF_NAME}"
+            push=true
+          else
+            version="$(git describe --tags --always)-dev"
+            push=false
+          fi
+          {
+            echo "version=${version}"
+            echo "push=${push}"
+            echo "image=${IMAGE_REPO}:appwrapper-${version}"
+            echo "date=$(date -u '+%Y-%m-%d %H:%M')"
+          } >> "${GITHUB_OUTPUT}"
+
+      # Compile on the runner's own platform for every target (Go cross-compiles via TARGETARCH),
+      # the same way `make docker-buildx` does, so no QEMU emulation is needed.
+      - name: Cross-compile Dockerfile
+        run: |
+          # shellcheck disable=SC2016 # ${BUILDPLATFORM} is for Docker, not for the shell
+          sed -e '1,/^FROM/ s/^FROM /FROM --platform=${BUILDPLATFORM} /' Dockerfile > Dockerfile.cross
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to quay.io
+        if: steps.v.outputs.push == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_ROBOT_TOKEN }}
+
+      - name: Build (and push for a tag)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.cross
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ steps.v.outputs.push == 'true' }}
+          tags: ${{ steps.v.outputs.image }}
+          build-args: |
+            BUILD_VERSION=${{ steps.v.outputs.version }}
+            BUILD_DATE=${{ steps.v.outputs.date }}
+          # A plain index with one manifest per platform: no attestation manifests.
+          provenance: false
+          sbom: false
+
+      - name: Generate install.yaml
+        if: steps.v.outputs.push == 'true'
+        env:
+          IMAGE: ${{ steps.v.outputs.image }}
+        run: make build-installer IMG="${IMAGE}"
+
+      - name: GitHub release
+        if: steps.v.outputs.push == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ steps.v.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: ./dist/install.yaml
+          body: |
+            Controller image: `${{ steps.v.outputs.image }}`
+            (also `containers.pl-open.science/milaboratories/pl-containers:appwrapper-${{ steps.v.outputs.version }}`)
