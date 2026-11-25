@@ -358,7 +358,7 @@ func (r *AppWrapperReconciler) createComponent(ctx context.Context, aw *awv1beta
 			Status: metav1.ConditionUnknown,
 			Reason: "ComponentCreationInitiated",
 		})
-		if err := r.Status().Patch(ctx, aw, client.MergeFrom(orig)); err != nil {
+		if err := r.Status().Patch(ctx, aw, statusPatch(orig)); err != nil {
 			return err, false
 		}
 	}
@@ -382,7 +382,7 @@ func (r *AppWrapperReconciler) createComponent(ctx context.Context, aw *awv1beta
 				Status: metav1.ConditionFalse,
 				Reason: "ComponentCreationErrored",
 			})
-			if patchErr := r.Status().Patch(ctx, aw, client.MergeFrom(orig)); patchErr != nil {
+			if patchErr := r.Status().Patch(ctx, aw, statusPatch(orig)); patchErr != nil {
 				// ugh.  Patch failed, so retry the create so we can get to a consistient state
 				return patchErr, false
 			}
@@ -398,7 +398,7 @@ func (r *AppWrapperReconciler) createComponent(ctx context.Context, aw *awv1beta
 		Status: metav1.ConditionTrue,
 		Reason: "ComponentCreatedSuccessfully",
 	})
-	if err := r.Status().Patch(ctx, aw, client.MergeFrom(orig)); err != nil {
+	if err := r.Status().Patch(ctx, aw, statusPatch(orig)); err != nil {
 		return err, false
 	}
 

@@ -297,6 +297,43 @@ var _ = Describe("AppWrapper Controller", func() {
 		Expect(meta.IsStatusConditionTrue(aw.Status.Conditions, string(awv1beta2.Unhealthy))).Should(BeTrue())
 	})
 
+	It("A status patch that uses a stale AppWrapper is rejected and requeued", func() {
+		advanceToResuming(pod(100, 1, true), pod(100, 0, false))
+		beginRunning()
+
+		By("Keeping a copy of the AppWrapper that becomes stale")
+		stale := getAppWrapper(awName)
+
+		By("Changing the AppWrapper on the API server after the copy was read")
+		aw := getAppWrapper(awName)
+		if aw.Annotations == nil {
+			aw.Annotations = map[string]string{}
+		}
+		aw.Annotations["test.appwrapper/stale-copy"] = "true"
+		Expect(k8sClient.Update(ctx, aw)).To(Succeed())
+
+		By("Deleting a component, so that the reconcile writes a new status")
+		cs := stale.Status.ComponentStatus[0]
+		victim := &metav1.PartialObjectMetadata{TypeMeta: metav1.TypeMeta{Kind: cs.Kind, APIVersion: cs.APIVersion}}
+		victim.Name = cs.Name
+		victim.Namespace = stale.Namespace
+		Expect(k8sClient.Delete(ctx, victim)).To(Succeed())
+
+		By("Reconciling with a cache that still holds the stale copy: the status patch is rejected")
+		awReconciler.Client = &staleAppWrapperClient{Client: k8sClient, stale: stale}
+		defer func() { awReconciler.Client = k8sClient }()
+		result, err := awReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: awName})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).Should(BeNumerically(">", 0))
+		Expect(getAppWrapper(awName).Status.Phase).Should(Equal(awv1beta2.AppWrapperRunning))
+
+		By("Reconciling with a current copy: Running -> Failed")
+		awReconciler.Client = k8sClient
+		_, err = awReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: awName})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getAppWrapper(awName).Status.Phase).Should(Equal(awv1beta2.AppWrapperFailed))
+	})
+
 	It("Happy Path Lifecycle", func() {
 		advanceToResuming(pod(100, 1, true), pod(100, 0, false))
 		beginRunning()

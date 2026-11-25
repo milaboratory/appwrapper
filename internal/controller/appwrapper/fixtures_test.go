@@ -295,3 +295,20 @@ func (c *cacheBlindToPods) Get(ctx context.Context, key client.ObjectKey, obj cl
 	}
 	return c.Client.Get(ctx, key, obj, opts...)
 }
+
+// staleAppWrapperClient simulates a controller-runtime cache that lags behind the API server:
+// Get returns an old copy of one AppWrapper, while every other operation (including status
+// patches) goes to the real client.  This reproduces a reconcile that starts before the cache
+// has observed the latest change to the AppWrapper.
+type staleAppWrapperClient struct {
+	client.Client
+	stale *awv1beta2.AppWrapper
+}
+
+func (c *staleAppWrapperClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if aw, ok := obj.(*awv1beta2.AppWrapper); ok && key == client.ObjectKeyFromObject(c.stale) {
+		c.stale.DeepCopyInto(aw)
+		return nil
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
