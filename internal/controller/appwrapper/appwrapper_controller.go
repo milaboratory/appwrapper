@@ -402,13 +402,14 @@ func (r *AppWrapperReconciler) reconcile(ctx context.Context, req ctrl.Request) 
 		podDetailsMessage := fmt.Sprintf("%v pods pending; %v pods running; %v pods succeeded", podStatus.pending, podStatus.running, podStatus.succeeded)
 		clearCondition(aw, awv1beta2.PodsReady, "InsufficientPodsReady", podDetailsMessage)
 		whenDeployed := meta.FindStatusCondition(aw.Status.Conditions, string(awv1beta2.ResourcesDeployed)).LastTransitionTime
+		graceStart := componentsCreatedAt(aw, whenDeployed)
 		var graceDuration time.Duration
 		if podStatus.pending+podStatus.running+podStatus.succeeded >= podStatus.expected {
 			graceDuration = r.warmupGraceDuration(ctx, aw)
 		} else {
 			graceDuration = r.admissionGraceDuration(ctx, aw)
 		}
-		if time.Now().Before(whenDeployed.Add(graceDuration)) {
+		if time.Now().Before(graceStart.Add(graceDuration)) {
 			return requeueAfter(5*time.Second, r.Status().Patch(ctx, aw, statusPatch(orig)))
 		} else {
 			meta.SetStatusCondition(&aw.Status.Conditions, metav1.Condition{
@@ -1027,6 +1028,31 @@ func (r *AppWrapperReconciler) apiReader() client.Reader {
 // The risk increases when more than one reconcile runs in parallel (maxConcurrentReconciles > 1).
 func statusPatch(orig *awv1beta2.AppWrapper) client.Patch {
 	return client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})
+}
+
+// componentsCreatedAt returns when the last component of the current deployment was created: the
+// latest LastTransitionTime of the components' ResourcesDeployed=True conditions. The admission and
+// warmup grace periods count from there, not from the AppWrapper's ResourcesDeployed condition, which
+// is set when the AppWrapper starts Resuming. The time a busy controller takes to get from that point
+// to creating the components is the controller's own delay; counting it would fail a workload that
+// the cluster has not had the full grace period to start. A component deleted on reset has its
+// condition set to False, so a redeployment sets a new time. Falls back to whenDeployed when no
+// component reports a creation time.
+func componentsCreatedAt(aw *awv1beta2.AppWrapper, whenDeployed metav1.Time) metav1.Time {
+	latest := metav1.Time{}
+	for _, cs := range aw.Status.ComponentStatus {
+		created := meta.FindStatusCondition(cs.Conditions, string(awv1beta2.ResourcesDeployed))
+		if created == nil || created.Status != metav1.ConditionTrue {
+			continue
+		}
+		if created.LastTransitionTime.After(latest.Time) {
+			latest = created.LastTransitionTime
+		}
+	}
+	if latest.IsZero() || latest.Before(&whenDeployed) {
+		return whenDeployed
+	}
+	return latest
 }
 
 // copyForStatusPatch returns an AppWrapper with an empty Spec and a DeepCopy of orig's Status for use in a subsequent Status().Patch(...) call

@@ -441,6 +441,51 @@ var _ = Describe("AppWrapper Controller", func() {
 		Expect(meta.IsStatusConditionTrue(aw.Status.Conditions, string(awv1beta2.QuotaReserved))).Should(BeFalse())
 	})
 
+	It("The admission grace period counts from the creation of the components, not from ResourcesDeployed", func() {
+		advanceJobSetToResuming()
+		awReconciler.Config.FaultTolerance.AdmissionGracePeriod = time.Minute
+
+		By("Simulating a busy controller: ResourcesDeployed was set two minutes before the components are created")
+		aw := getAppWrapper(awName)
+		for i := range aw.Status.Conditions {
+			if aw.Status.Conditions[i].Type == string(awv1beta2.ResourcesDeployed) {
+				aw.Status.Conditions[i].LastTransitionTime = metav1.NewTime(time.Now().Add(-2 * time.Minute))
+			}
+		}
+		Expect(k8sClient.Status().Update(ctx, aw)).To(Succeed())
+
+		By("Reconciling: Resuming -> Running, the JobSet is created now")
+		_, err := awReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: awName})
+		Expect(err).NotTo(HaveOccurred())
+		aw = getAppWrapper(awName)
+		Expect(aw.Status.Phase).Should(Equal(awv1beta2.AppWrapperRunning))
+		Expect(aw.Status.ComponentStatus).Should(HaveLen(1))
+
+		By("Reconciling: Running with no pods yet stays Running, within the grace period of the component")
+		_, err = awReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: awName})
+		Expect(err).NotTo(HaveOccurred())
+		aw = getAppWrapper(awName)
+		Expect(aw.Status.Phase).Should(Equal(awv1beta2.AppWrapperRunning))
+		Expect(meta.IsStatusConditionTrue(aw.Status.Conditions, string(awv1beta2.Unhealthy))).Should(BeFalse())
+
+		By("Simulating a component created two minutes ago: the grace period has run out")
+		for i := range aw.Status.ComponentStatus[0].Conditions {
+			if aw.Status.ComponentStatus[0].Conditions[i].Type == string(awv1beta2.ResourcesDeployed) {
+				aw.Status.ComponentStatus[0].Conditions[i].LastTransitionTime = metav1.NewTime(time.Now().Add(-2 * time.Minute))
+			}
+		}
+		Expect(k8sClient.Status().Update(ctx, aw)).To(Succeed())
+
+		By("Reconciling: Running -> Failed with InsufficientPodsReady")
+		_, err = awReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: awName})
+		Expect(err).NotTo(HaveOccurred())
+		aw = getAppWrapper(awName)
+		Expect(aw.Status.Phase).Should(Equal(awv1beta2.AppWrapperFailed))
+		unhealthy := meta.FindStatusCondition(aw.Status.Conditions, string(awv1beta2.Unhealthy))
+		Expect(unhealthy).NotTo(BeNil())
+		Expect(unhealthy.Reason).Should(Equal("InsufficientPodsReady"))
+	})
+
 	It("A JobSet reporting Failed leads to a failed AppWrapper", func() {
 		advanceJobSetToResuming()
 
