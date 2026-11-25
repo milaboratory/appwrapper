@@ -37,6 +37,10 @@ type AppWrapperConfig struct {
 	FaultTolerance         *FaultToleranceConfig `json:"faultTolerance,omitempty"`
 	SchedulerName          string                `json:"schedulerName,omitempty"`
 	DefaultQueueName       string                `json:"defaultQueueName,omitempty"`
+	// MaxConcurrentReconciles is the number of AppWrappers the controller reconciles in parallel.
+	// controller-runtime never reconciles the same AppWrapper in two workers at once.
+	// 0 (unset) means 1, the controller-runtime default.
+	MaxConcurrentReconciles int `json:"maxConcurrentReconciles,omitempty"`
 }
 
 type AutopilotConfig struct {
@@ -114,6 +118,9 @@ func NewAppWrapperConfig() *AppWrapperConfig {
 }
 
 func ValidateAppWrapperConfig(config *AppWrapperConfig) error {
+	if config.MaxConcurrentReconciles < 0 {
+		return fmt.Errorf("MaxConcurrentReconciles %v is negative", config.MaxConcurrentReconciles)
+	}
 	if config.FaultTolerance.ForcefulDeletionGracePeriod > config.FaultTolerance.GracePeriodMaximum {
 		return fmt.Errorf("ForcefulDelectionGracePeriod %v exceeds GracePeriodCeiling %v",
 			config.FaultTolerance.ForcefulDeletionGracePeriod, config.FaultTolerance.GracePeriodMaximum)

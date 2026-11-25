@@ -35,6 +35,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -981,7 +982,16 @@ func (r *AppWrapperReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&awv1beta2.AppWrapper{}).
 		Watches(&v1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.podMapFunc)).
 		Named(awv1beta2.AppWrapperKind).
+		WithOptions(controller.Options{MaxConcurrentReconciles: r.maxConcurrentReconciles()}).
 		Complete(r)
+}
+
+// maxConcurrentReconciles returns the configured number of parallel reconciles, at least 1.
+func (r *AppWrapperReconciler) maxConcurrentReconciles() int {
+	if r.Config == nil || r.Config.MaxConcurrentReconciles < 1 {
+		return 1
+	}
+	return r.Config.MaxConcurrentReconciles
 }
 
 // apiReader returns a Reader that bypasses the controller-runtime cache.
