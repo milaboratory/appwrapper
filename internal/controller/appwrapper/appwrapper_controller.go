@@ -103,10 +103,23 @@ type componentStatusSummary struct {
 // Reconcile reconciles an appwrapper
 // Please see [aw-states] for documentation of this method.
 //
-// [aw-states]: https://project-codeflare.github.io/appwrapper/arch-controller/#framework-controller
+// A Conflict error means that this reconcile read a stale copy of the AppWrapper:
+// the API server has a newer version, and the write that used the stale copy was rejected.
+// This is not a failure. Reconcile requeues the AppWrapper without an error, so that
+// the next reconcile reads the newer version.
 //
-//gocyclo:ignore
+// [aw-states]: https://project-codeflare.github.io/appwrapper/arch-controller/#framework-controller
 func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	result, err := r.reconcile(ctx, req)
+	if apierrors.IsConflict(err) {
+		log.FromContext(ctx).V(2).Info("Stale AppWrapper; write rejected with Conflict, requeueing", "error", err.Error())
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	return result, err
+}
+
+//gocyclo:ignore
+func (r *AppWrapperReconciler) reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	aw := &awv1beta2.AppWrapper{}
 	if err := r.Get(ctx, req.NamespacedName, aw); err != nil {
 		return ctrl.Result{}, nil
@@ -128,7 +141,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 					if aw.Status.Phase != awv1beta2.AppWrapperTerminating {
 						// Set Phase for better UX, but ignore errors. We still want to requeue after 5 seconds (not immediately)
 						aw.Status.Phase = awv1beta2.AppWrapperTerminating
-						_ = r.Status().Patch(ctx, aw, client.MergeFrom(orig))
+						_ = r.Status().Patch(ctx, aw, statusPatch(orig))
 					}
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil // check after a short while
 				}
@@ -151,7 +164,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				statusUpdated = true
 			}
 			if statusUpdated {
-				if err := r.Status().Patch(ctx, aw, client.MergeFrom(orig)); err != nil {
+				if err := r.Status().Patch(ctx, aw, statusPatch(orig)); err != nil {
 					return ctrl.Result{}, err
 				}
 			}
@@ -225,6 +238,10 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		err, fatal := r.createComponents(ctx, aw) // NOTE: createComponents applies patches to aw.Status incrementally as resources are created
 		orig := copyForStatusPatch(aw)
 		if err != nil {
+			if apierrors.IsConflict(err) {
+				// A status patch used a stale copy of the AppWrapper. This is not a create failure.
+				return ctrl.Result{}, err
+			}
 			if !fatal {
 				startTime := meta.FindStatusCondition(aw.Status.Conditions, string(awv1beta2.ResourcesDeployed)).LastTransitionTime
 				graceDuration := r.admissionGraceDuration(ctx, aw)
@@ -349,7 +366,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			now := time.Now()
 			deadline := whenDetected.Add(gracePeriod)
 			if now.Before(deadline) {
-				return requeueAfter(deadline.Sub(now), r.Status().Patch(ctx, aw, client.MergeFrom(orig)))
+				return requeueAfter(deadline.Sub(now), r.Status().Patch(ctx, aw, statusPatch(orig)))
 			} else {
 				r.Recorder.Eventf(aw, nil, v1.EventTypeNormal, "FoundFailedPods", string(awv1beta2.Unhealthy), "%v failed pods", podStatus.failed)
 				return ctrl.Result{}, r.resetOrFail(ctx, orig, aw, podStatus.terminalFailure, 1)
@@ -378,7 +395,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				Reason:  "SufficientPodsReady",
 				Message: fmt.Sprintf("%v pods running; %v pods succeeded", podStatus.running, podStatus.succeeded),
 			})
-			return requeueAfter(time.Minute, r.Status().Patch(ctx, aw, client.MergeFrom(orig)))
+			return requeueAfter(time.Minute, r.Status().Patch(ctx, aw, statusPatch(orig)))
 		}
 
 		// Not ready yet; either continue to wait or giveup if the warmup period has expired
@@ -392,7 +409,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			graceDuration = r.admissionGraceDuration(ctx, aw)
 		}
 		if time.Now().Before(whenDeployed.Add(graceDuration)) {
-			return requeueAfter(5*time.Second, r.Status().Patch(ctx, aw, client.MergeFrom(orig)))
+			return requeueAfter(5*time.Second, r.Status().Patch(ctx, aw, statusPatch(orig)))
 		} else {
 			meta.SetStatusCondition(&aw.Status.Conditions, metav1.Condition{
 				Type:    string(awv1beta2.Unhealthy),
@@ -409,7 +426,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// finish undeploying components irrespective of desired state (suspend bit)
 		if meta.IsStatusConditionTrue(aw.Status.Conditions, string(awv1beta2.ResourcesDeployed)) {
 			if !r.deleteComponents(ctx, aw) {
-				return requeueAfter(5*time.Second, r.Status().Patch(ctx, aw, client.MergeFrom(orig)))
+				return requeueAfter(5*time.Second, r.Status().Patch(ctx, aw, statusPatch(orig)))
 			}
 			meta.SetStatusCondition(&aw.Status.Conditions, metav1.Condition{
 				Type:    string(awv1beta2.ResourcesDeployed),
@@ -438,7 +455,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		clearCondition(aw, awv1beta2.PodsReady, string(awv1beta2.AppWrapperResetting), "")
 		if meta.IsStatusConditionTrue(aw.Status.Conditions, string(awv1beta2.ResourcesDeployed)) {
 			if !r.deleteComponents(ctx, aw) {
-				return requeueAfter(5*time.Second, r.Status().Patch(ctx, aw, client.MergeFrom(orig)))
+				return requeueAfter(5*time.Second, r.Status().Patch(ctx, aw, statusPatch(orig)))
 			}
 			meta.SetStatusCondition(&aw.Status.Conditions, metav1.Condition{
 				Type:    string(awv1beta2.ResourcesDeployed),
@@ -454,7 +471,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		now := time.Now()
 		deadline := whenReset.Add(pauseDuration)
 		if now.Before(deadline) {
-			return requeueAfter(deadline.Sub(now), r.Status().Patch(ctx, aw, client.MergeFrom(orig)))
+			return requeueAfter(deadline.Sub(now), r.Status().Patch(ctx, aw, statusPatch(orig)))
 		}
 
 		meta.SetStatusCondition(&aw.Status.Conditions, metav1.Condition{
@@ -485,13 +502,13 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			now := time.Now()
 			deadline := whenDelayed.Add(deletionDelay)
 			if now.Before(deadline) {
-				return requeueAfter(deadline.Sub(now), r.Status().Patch(ctx, aw, client.MergeFrom(orig)))
+				return requeueAfter(deadline.Sub(now), r.Status().Patch(ctx, aw, statusPatch(orig)))
 			}
 		}
 
 		if meta.IsStatusConditionTrue(aw.Status.Conditions, string(awv1beta2.ResourcesDeployed)) {
 			if !r.deleteComponents(ctx, aw) {
-				return requeueAfter(5*time.Second, r.Status().Patch(ctx, aw, client.MergeFrom(orig)))
+				return requeueAfter(5*time.Second, r.Status().Patch(ctx, aw, statusPatch(orig)))
 			}
 			msg := "Resources deleted for failed AppWrapper"
 			if deletionDelay > 0 && aw.Spec.Suspend {
@@ -510,7 +527,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			Reason:  string(awv1beta2.AppWrapperFailed),
 			Message: "No resources deployed",
 		})
-		return ctrl.Result{}, r.Status().Patch(ctx, aw, client.MergeFrom(orig))
+		return ctrl.Result{}, r.Status().Patch(ctx, aw, statusPatch(orig))
 
 	case awv1beta2.AppWrapperSucceeded:
 		if meta.IsStatusConditionTrue(aw.Status.Conditions, string(awv1beta2.ResourcesDeployed)) {
@@ -524,7 +541,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 			orig := copyForStatusPatch(aw)
 			if !r.deleteComponents(ctx, aw) {
-				return requeueAfter(5*time.Second, r.Status().Patch(ctx, aw, client.MergeFrom(orig)))
+				return requeueAfter(5*time.Second, r.Status().Patch(ctx, aw, statusPatch(orig)))
 			}
 			meta.SetStatusCondition(&aw.Status.Conditions, metav1.Condition{
 				Type:    string(awv1beta2.ResourcesDeployed),
@@ -532,7 +549,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				Reason:  string(awv1beta2.AppWrapperSucceeded),
 				Message: fmt.Sprintf("Time to live after success of %v expired", deletionDelay),
 			})
-			return ctrl.Result{}, r.Status().Patch(ctx, aw, client.MergeFrom(orig))
+			return ctrl.Result{}, r.Status().Patch(ctx, aw, statusPatch(orig))
 		}
 		return ctrl.Result{}, nil
 	}
@@ -542,7 +559,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 func (r *AppWrapperReconciler) transitionToPhase(ctx context.Context, orig *awv1beta2.AppWrapper, modified *awv1beta2.AppWrapper, phase awv1beta2.AppWrapperPhase) error {
 	modified.Status.Phase = phase
-	if err := r.Status().Patch(ctx, modified, client.MergeFrom(orig)); err != nil {
+	if err := r.Status().Patch(ctx, modified, statusPatch(orig)); err != nil {
 		return err
 	}
 	log.FromContext(ctx).Info(string(phase), "phase", phase)
@@ -1001,6 +1018,15 @@ func (r *AppWrapperReconciler) apiReader() client.Reader {
 		return r.APIReader
 	}
 	return r.Client
+}
+
+// statusPatch returns the patch for a Status().Patch(...) call that uses orig as its base.
+// The patch carries the resourceVersion of orig. If the AppWrapper changed on the API server
+// after orig was read, the API server rejects the patch with a Conflict error. Without this
+// check, a reconcile that read a stale copy from the cache can write over a newer status.
+// The risk increases when more than one reconcile runs in parallel (maxConcurrentReconciles > 1).
+func statusPatch(orig *awv1beta2.AppWrapper) client.Patch {
+	return client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})
 }
 
 // copyForStatusPatch returns an AppWrapper with an empty Spec and a DeepCopy of orig's Status for use in a subsequent Status().Patch(...) call
