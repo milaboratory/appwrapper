@@ -61,5 +61,11 @@ var _ = Describe("AppWrapper Config", func() {
 
 		bad = &FaultToleranceConfig{SuccessTTL: -1 * time.Second}
 		Expect(ValidateAppWrapperConfig(&AppWrapperConfig{FaultTolerance: bad})).ShouldNot(Succeed())
+
+		awc = NewAppWrapperConfig()
+		awc.MaxConcurrentReconciles = 8
+		Expect(ValidateAppWrapperConfig(awc)).Should(Succeed())
+		awc.MaxConcurrentReconciles = -1
+		Expect(ValidateAppWrapperConfig(awc)).ShouldNot(Succeed())
 	})
 })
