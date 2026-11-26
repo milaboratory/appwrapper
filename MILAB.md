@@ -11,6 +11,7 @@ release line: an upstream release plus the changes below.
 | Confirm a missing component with an uncached read before failing | The controller can read a Job it has just created from a stale cache and fail the workload at once (`MissingComponent: Only found 0 deployed components`) | PR project-codeflare/appwrapper#417 (open) |
 | `appwrapper.maxConcurrentReconciles` in the operator config | One reconcile worker can fall behind during a burst of submissions and create Jobs late; the delay counts against the admission grace period | not proposed yet |
 | Status patches carry the AppWrapper's `resourceVersion` (optimistic lock) | A reconcile can read a stale AppWrapper from the cache and write over a newer status; parallel reconciles make this more frequent. The API server now rejects such a patch with a Conflict, and the controller requeues the AppWrapper | not proposed yet |
+| Admission and warmup grace periods count from the creation of the components | The timer started at `ResourcesDeployed`, which is set before the controller creates the components; a busy controller spent part of the grace period itself and failed healthy workloads with `InsufficientPodsReady` | not proposed yet |
 
 ## Configuration
 
